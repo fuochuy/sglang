@@ -109,6 +109,7 @@ class HiCacheShmPeerL2(HiCacheStorage):
         mem_pool_host=None,
     ):
         self._cfg = storage_config
+        self._v2_warned: bool = False
         self._capacity: int = _DEFAULT_CAPACITY
         self._capacity_user_set: bool = False
         self._shm_dir: str = "/dev/shm"
@@ -511,6 +512,25 @@ class HiCacheShmPeerL2(HiCacheStorage):
                 )
                 results.append(False)
         return results
+
+    # ── V2 stubs — extra-pool multi-transfer interface ───────────────────────
+    # shm_peer_l2 shares main KV only via pointer index (V1 path).
+    # Sidecar pools (DSA, Mamba, ...) are not replicated across DP ranks.
+    # Return all-False so HybridCacheController records 0 hit pages and
+    # continues without crashing.  Log once so operators are aware.
+
+    def batch_set_v2(self, transfers, extra_info=None):
+        if transfers and not self._v2_warned:
+            self._v2_warned = True
+            logger.warning(
+                "HiCacheShmPeerL2: sidecar pools %s will not be backed up to "
+                "L3 (shm_peer_l2 only supports main KV via V1 interface).",
+                [t.name for t in transfers],
+            )
+        return {t.name: [False] * len(t.keys) for t in transfers}
+
+    def batch_get_v2(self, transfers, extra_info=None):
+        return {t.name: [False] * len(t.keys) for t in transfers}
 
     # ── V0 stubs — required by the abstract base class ───────────────────────
 

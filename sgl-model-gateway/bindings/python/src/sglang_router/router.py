@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Optional
 
@@ -330,6 +331,14 @@ class Router:
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)
+
+        # Strip any remaining keys not accepted by the compiled _Router binary so
+        # that Python-side fields added after the binary was built don't crash startup.
+        try:
+            _router_params = set(inspect.signature(_Router).parameters)
+            args_dict = {k: v for k, v in args_dict.items() if k in _router_params}
+        except (ValueError, TypeError):
+            pass
 
         return Router(_Router(**args_dict))
 

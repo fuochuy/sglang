@@ -1,0 +1,142 @@
+# GLM-5.2-W4AFP8 on 4xH200 — SGLang worker + router (4x dev mirror, 2026-08-09)
+#
+# Derived from compose/2026-08-09_20h40m11-glm52-h200-8x.yaml (prod mirror on 8xH200) by
+# scaling the topology to 4 GPUs and applying the requested edits.
+#
+# Edits vs the 8x source (all others kept byte-for-byte from the 8x prod mirror):
+#   - Topology:  TP 8 -> 4   (DP stays 4)   EP 8 -> 4
+#                 attn_tp = tp/dp = 1 (attention is pure-DP, one rank per GPU);
+#                 EP = TP = 4 (experts sharded across all 4 GPUs), same pattern as prod.
+#                 Constraints verified in sglang server_args.py:
+#                   tp_size % dp_size == 0            (4 % 4 == 0)
+#                   ep_size * moe_dp_size == tp_size  (4 * 1 == 4)
+#   - --chunked-prefill-size 32768 -> 16384
+#   - --mem-fraction-static   0.75  -> 0.88  (requested 0.80, but TP=4 holds 2x
+#     weights/GPU vs TP=8 and DP=4 replicates MLA attention per GPU, so static mem
+#     ≈117GB/GPU; 0.80 leaves no KV room. sglang requires ≥0.813; 0.88 gives ~9.5GB
+#     KV/GPU. Verified: boot at 0.80 fails with "no GPU memory for the KV cache".)
+#   - Removed --enable-prefill-delayer (per request)
+#   - --tokenizer-worker-num 8 -> 4 (match GPU count)
+#   - --numa-node 0 0 0 0 1 1 1 1 -> 0 0 0 0 (all 4 GPUs on NUMA node 0;
+#     verified via nvidia-smi topo -m: CPU affinity 0-103, NUMA affinity 0-1)
+#   - GPU count 8 -> 4 (deploy reservations)
+#   - memory limit 1420g -> 700g (box has 787 GB RAM). NOT conservative: hicache-size 128
+#     is per-DP-rank shmem, so 4 ranks × ~127 GB = ~508 GB, plus DSA indexer 4 × 25.76 GB
+#     = ~103 GB, plus ~30 GB host overhead ≈ 641 GB resident. The first boot OOM-killed at
+#     500g (dmesg: "Memory cgroup out of memory: Killed process sglang::schedul, shmem-rss
+#     ~127GB"). 700g leaves ~60 GB container margin + ~87 GB host headroom. Keeping
+#     hicache 128 (prod parity) rather than reducing it.
+#   - container_name *-20260809-* -> glm52-4xh200-{worker,router} (avoid clashes
+#     with the stopped glm52-worker/router/capture/deepep-test containers on this host).
+#
+# Kept from 8x prod mirror (NOT changed): host network, ipc host, the full dp-attention
+# flag set (--enable-dp-attention + local-control-broadcast + dp-lm-head, SGLANG_DP_USE_GATHERV,
+# SGLANG_ENABLE_METRICS_DP_ATTENTION), kv-cache-dtype fp8_e4m3, dsa-prefill flashmla_sparse_q8,
+# hicache 128/direct/write_back, EAGLE 3/1/4, schedule fcfs, max-running-requests 256,
+# context-length 500000. moe_a2a_backend defaults to "none" (sglang default), so this does
+# NOT use DeepEP — safe from the W4AFP8+DeepEP issue tracked on this branch.
+#
+# NOTE on 4x capacity: total KV cache ~ halves vs 8x (4 GPUs vs 8; mem-fraction 0.88 vs 0.75
+# only partly offsets). max-running-requests 256 / context 500000 are kept per the 8x mirror;
+# they boot fine but may need lowering under real load to avoid KV OOM. Tune after boot.
+#
+# Run:
+#   MODELS_DIR=/mnt/models docker compose -f compose/2026-08-09_21h05m14-glm52-h200-4x.yaml up
+# Optional dev mounts (not in prod): add  - ./logs:/workspace/results  for crash dumps.
+
+services:
+  worker:
+    image: vcr.vngcloud.vn/107710-huynp4-kc/sg-lang:fuochuy-hicache
+    container_name: glm52-4xh200-worker
+    network_mode: host
+    ipc: host
+    shm_size: 32g
+    command: >
+      python3 -m sglang.launch_server
+      --model-path /models/PhalaCloud/GLM-5.2-W4AFP8
+      --quantization w4afp8
+      --served-model-name zai-org/GLM-5.2-FP8
+      --host 0.0.0.0
+      --port 8889
+      --tp 4
+      --dp 4
+      --ep 4
+      --enable-dp-attention
+      --enable-dp-attention-local-control-broadcast
+      --enable-dp-lm-head
+      --tokenizer-worker-num 4
+      --dist-init-addr 127.0.0.1:10888
+      --numa-node 0 0 0 0
+      --chunked-prefill-size 16384
+      --tool-call-parser glm47
+      --reasoning-parser glm45
+      --mem-fraction-static 0.88
+      --max-running-requests 128
+      --context-length 500000
+      --kv-cache-dtype fp8_e4m3
+      --dsa-prefill-backend flashmla_sparse_q8
+      --allow-auto-truncate
+      --enable-metrics
+      --enable-cache-report
+      --enable-hierarchical-cache
+      --hicache-size 64
+      --hicache-io-backend direct
+      --hicache-mem-layout page_first_direct
+      --hicache-write-policy write_through
+      --hicache-storage-backend shm_peer_l2
+      --speculative-algorithm EAGLE
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --schedule-policy fcfs
+    environment:
+      SGLANG_DP_USE_GATHERV: "1"
+      NCCL_P2P_LEVEL: "NVL"
+      HF_HUB_OFFLINE: "1"
+      SGLANG_TORCH_PROFILER_DIR: "/models/_profiles"
+      SGLANG_PROFILE_WITH_STACK: "False"
+      SGLANG_ENABLE_METRICS_DP_ATTENTION: "1"
+    volumes:
+      - ${MODELS_DIR:-/mnt/models}:/models:ro
+    deploy:
+      resources:
+        limits:
+          memory: 700g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 4
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8889/health', timeout=10); sys.exit(0)"]
+      interval: 15s
+      timeout: 30s
+      retries: 200
+      start_period: 300s
+    restart: "no"
+
+  router:
+    image: vcr.vngcloud.vn/107710-huynp4-kc/sg-lang:fuochuy-hicache
+    container_name: glm52-4xh200-router
+    network_mode: host
+    depends_on:
+      worker:
+        condition: service_healthy
+    volumes:
+      - ${MODELS_DIR:-/mnt/models}:/models:ro   # ← thêm dòng này
+    command: >
+      python3 -m sglang_router.launch_router
+      --worker-urls=http://127.0.0.1:8889
+      --policy=cache_aware
+      --balance-abs-threshold=8
+      --request-id-headers=x-correlation-id
+      --dp-aware
+      --host=0.0.0.0
+      --port=8888
+      --prometheus-host=0.0.0.0
+      --prometheus-port=18888
+      --connect-timeout-secs=900
+      --request-timeout-secs=14400
+      --disable-health-check
+      --disable-retries
+    restart: "no"
