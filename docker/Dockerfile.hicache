@@ -1,0 +1,79 @@
+# Patch image: layers fork's Python source + freshly-built sglang-router Rust
+# extension on top of a release image.
+#
+# Two stages:
+#   router-builder — compiles sgl-model-gateway from source on linux/amd64.
+#                    Produces a manylinux wheel containing the Rust .so with
+#                    the cache-aware PD pool-isolation fixes (e8d57e7, adc203d).
+#   final          — installs the wheel over the base image, replacing both
+#                    the compiled .so and the Python files in one step.
+#
+# Usage:
+#   docker build \
+#     --platform linux/amd64 \
+#     --build-arg BASE_IMAGE=lmsysorg/sglang:v0.5.16 \
+#     -f docker/Dockerfile.hicache \
+#     -t vcr.vngcloud.vn/107710-huynp4-kc/sg-lang:fuochuy-hicache \
+#     .
+#
+
+# Declare BASE_IMAGE at global scope so it's visible to the second FROM.
+ARG BASE_IMAGE
+
+######################## STAGE 1 — build sglang-router wheel ########################
+FROM ubuntu:24.04 AS router-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+       curl git build-essential libssl-dev pkg-config \
+       protobuf-compiler libprotobuf-dev \
+       python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain — version pinned by sgl-model-gateway/rust-toolchain.toml (1.90).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+
+COPY sgl-model-gateway/ /opt/sglang/sgl-model-gateway/
+
+WORKDIR /opt/sglang/sgl-model-gateway/bindings/python
+
+# maturin build --release --features vendored-openssl: bundles OpenSSL statically
+# so the .so has no runtime dep on the host libssl version.
+# --break-system-packages: Ubuntu 24.04 marks python3 as externally-managed (PEP 668);
+# we're inside a throw-away builder stage so there is no system to break.
+RUN pip3 install --no-cache-dir --break-system-packages maturin \
+    && maturin build --release --features vendored-openssl --out dist
+
+######################## STAGE 2 — final image ##############################
+# Re-declare BASE_IMAGE inside this stage to make it visible here.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Remove stale bytecode from the installed package
+RUN find /usr/local/lib/python3.12/dist-packages/sglang \
+      -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# Upgrade sglang-kernel to version required by this fork.
+# deep_gemm was bundled in sglang-kernel==0.4.2; 0.4.5 ships it as a
+# separate package, so reinstall it explicitly after upgrading the kernel.
+RUN pip install sglang-kernel==0.4.5 --force-reinstall --no-deps \
+    && pip install sgl-deep-gemm==0.1.5 --force-reinstall --no-deps
+
+# Copy fork's Python source directly into the installed package location
+COPY python/sglang /usr/local/lib/python3.12/dist-packages/sglang/
+
+# Install the freshly-built sglang-router wheel.  This replaces BOTH the
+# compiled Rust .so (with cache-aware PD pool-isolation fixes) AND the
+# Python files in one step — supersedes the old .py-only patch approach.
+COPY --from=router-builder \
+     /opt/sglang/sgl-model-gateway/bindings/python/dist/*.whl /tmp/sglang_router/
+RUN pip install --force-reinstall /tmp/sglang_router/*.whl \
+    && rm -rf /tmp/sglang_router/
+
+# Fixed GLM-5.2 chat template: replaces m.content.0.type / m.content.0 is /
+# m.content.0.output with bracket notation ([0]) so minijinja can parse it.
+# Use via: --chat-template /opt/glm52_chat_template.jinja in the router command.
+COPY docker/glm52_chat_template.jinja /opt/glm52_chat_template.jinja

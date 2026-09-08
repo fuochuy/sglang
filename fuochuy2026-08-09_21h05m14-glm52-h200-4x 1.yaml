@@ -130,7 +130,6 @@ services:
       --policy=cache_aware
       --balance-abs-threshold=8
       --request-id-headers=x-correlation-id
-      --dp-aware
       --host=0.0.0.0
       --port=8888
       --prometheus-host=0.0.0.0
@@ -139,4 +138,5 @@ services:
       --request-timeout-secs=14400
       --disable-health-check
       --disable-retries
+      --chat-template=/opt/glm52_chat_template.jinja
     restart: "no"
